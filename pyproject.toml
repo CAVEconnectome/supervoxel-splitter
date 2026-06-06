@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "supervoxel-splitter"
+dynamic = ["version"]
+requires-python = ">=3.14"
+description = "Pluggable supervoxel splitting algorithms with a uniform interface."
+readme = "README.md"
+license = { file = "LICENSE" }
+keywords = [
+    "connectomics",
+    "segmentation",
+    "supervoxel",
+    "watershed",
+    "geodesic",
+    "image-processing",
+]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "numpy",
+    "scipy>=1.6",
+    "fastremap",
+    "connected-components-3d",
+    "scikit-image",
+    "edt",
+]
+
+[project.urls]
+Homepage = "https://github.com/CAVEconnectome/supervoxel-splitter"
+Issues = "https://github.com/CAVEconnectome/supervoxel-splitter/issues"
+Source = "https://github.com/CAVEconnectome/supervoxel-splitter"
+
+[project.optional-dependencies]
+fast = ["dijkstra3d"]
+learned = []
+dev = ["pytest", "pytest-cov", "black", "pre-commit", "build"]
+
+[tool.setuptools.packages.find]
+include = ["supervoxel_splitter*"]
+
+[tool.setuptools_scm]
+fallback_version = "0.0.0.dev0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
