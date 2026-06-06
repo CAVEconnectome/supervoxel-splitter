@@ -64,6 +64,7 @@ class GeodesicSplitter:
         narrow_band_rel: float = 0.08,
         nb_dilate: int = 1,
         downsample_geodesic: tuple[int, int, int] | None = None,
+        seed_prep_downsample: tuple[int, int, int] | None = None,
         allow_third_label: bool = True,
         enforce_single_cc: bool = True,
         backend: str = "dj3d",
@@ -85,7 +86,15 @@ class GeodesicSplitter:
         self.backend = backend
         self.parallel = parallel
         self.snap_kwargs = {**_DEFAULT_SNAP_KWARGS, **(snap_kwargs or {})}
-        self.seed_prep = RidgeConnectPrep() if seed_prep is None else seed_prep
+        self.seed_prep = (
+            RidgeConnectPrep(
+                profiler=profiler,
+                snap_kwargs=snap_kwargs,
+                downsample=seed_prep_downsample or downsample_geodesic or (2, 2, 1),
+            )
+            if seed_prep is None
+            else seed_prep
+        )
         self.raise_if_multi_cc = raise_if_multi_cc
         self.profiler = profiler
 
@@ -103,24 +112,40 @@ class GeodesicSplitter:
         aug_sources_out = None
         aug_sinks_out = None
         srcs_used, snks_used = sources, sinks
+        seed_prep_elapsed = 0.0
         if self.seed_prep is not None:
+            t_sp = perf_counter()
             with self.profiler.profile("seed_prep"):
                 aug_a, aug_b, ok_a, ok_b = self.seed_prep.prepare(
-                    mask, sources, sinks,
-                    voxel_size=voxel_size, vol_order=vol_order,
-                    vox_order=vox_order, seed_order=seed_order,
+                    mask,
+                    sources,
+                    sinks,
+                    voxel_size=voxel_size,
+                    vol_order=vol_order,
+                    vox_order=vox_order,
+                    seed_order=seed_order,
                 )
+            seed_prep_elapsed = perf_counter() - t_sp
             if not (ok_a and ok_b):
                 raise RuntimeError("seed prep failed for at least one team")
             srcs_used, snks_used = aug_a, aug_b
             aug_sources_out, aug_sinks_out = aug_a, aug_b
 
         run = _GeodesicRun(
-            self, mask, srcs_used, snks_used,
-            voxel_size=voxel_size, vol_order=vol_order,
-            vox_order=vox_order, seed_order=seed_order,
+            self,
+            mask,
+            srcs_used,
+            snks_used,
+            voxel_size=voxel_size,
+            vol_order=vol_order,
+            vox_order=vox_order,
+            seed_order=seed_order,
         )
-        return run.execute(aug_sources=aug_sources_out, aug_sinks=aug_sinks_out)
+        result = run.execute(aug_sources=aug_sources_out, aug_sinks=aug_sinks_out)
+        result.diagnostics.setdefault("stage_elapsed_s", {})[
+            "seed_prep"
+        ] = seed_prep_elapsed
+        return result
 
 
 class _GeodesicRun:
@@ -205,25 +230,42 @@ class _GeodesicRun:
         """
         ds = self.cfg.downsample_geodesic
         if ds is None:
-            return self.travel_cost, self.sv_crop, self.sampling, ds, \
-                [tuple(p) for p in self.a_crop.tolist()], \
-                [tuple(p) for p in self.b_crop.tolist()]
+            return (
+                self.travel_cost,
+                self.sv_crop,
+                self.sampling,
+                ds,
+                [tuple(p) for p in self.a_crop.tolist()],
+                [tuple(p) for p in self.b_crop.tolist()],
+            )
         dz, dy, dx = (int(s) for s in ds)
         cost_ds = self.travel_cost[::dz, ::dy, ::dx]
         mask_ds = self.sv_crop[::dz, ::dy, ::dx]
-        sampling_ds = (self.sampling[0] * dz, self.sampling[1] * dy, self.sampling[2] * dx)
+        sampling_ds = (
+            self.sampling[0] * dz,
+            self.sampling[1] * dy,
+            self.sampling[2] * dx,
+        )
 
         def _to_ds(pts):
             pts = (np.asarray(pts, int) // np.array([dz, dy, dx])).astype(int)
             Zs, Ys, Xs = mask_ds.shape
-            return [(z, y, x) for z, y, x in pts
-                    if 0 <= z < Zs and 0 <= y < Ys and 0 <= x < Xs and mask_ds[z, y, x]]
+            return [
+                (z, y, x)
+                for z, y, x in pts
+                if 0 <= z < Zs and 0 <= y < Ys and 0 <= x < Xs and mask_ds[z, y, x]
+            ]
 
         a_sub, b_sub = _to_ds(self.a_crop), _to_ds(self.b_crop)
         if len(a_sub) == 0 or len(b_sub) == 0:
-            return self.travel_cost, self.sv_crop, self.sampling, None, \
-                [tuple(p) for p in self.a_crop.tolist()], \
-                [tuple(p) for p in self.b_crop.tolist()]
+            return (
+                self.travel_cost,
+                self.sv_crop,
+                self.sampling,
+                None,
+                [tuple(p) for p in self.a_crop.tolist()],
+                [tuple(p) for p in self.b_crop.tolist()],
+            )
         return cost_ds, mask_ds, sampling_ds, (dz, dy, dx), a_sub, b_sub
 
     def _label_on_grid(self, arrival, mask_ds, a_sub, b_sub) -> np.ndarray:
@@ -235,12 +277,18 @@ class _GeodesicRun:
         reldiff[finite] = np.abs(TA[finite] - TB[finite]) / denom[finite]
         band = finite & (reldiff <= self.cfg.narrow_band_rel)
         if self.cfg.nb_dilate > 0:
-            band = ndi.binary_dilation(band, structure=ball(self.cfg.nb_dilate)) & mask_ds
+            band = (
+                ndi.binary_dilation(band, structure=ball(self.cfg.nb_dilate)) & mask_ds
+            )
         if band.sum() < 64:
             band = mask_ds.copy()
 
-        denom_a = 1.0 + self.cfg.k_prox * np.exp(-self.cfg.lambda_prox * np.clip(TB, 0, np.inf))
-        denom_b = 1.0 + self.cfg.k_prox * np.exp(-self.cfg.lambda_prox * np.clip(TA, 0, np.inf))
+        denom_a = 1.0 + self.cfg.k_prox * np.exp(
+            -self.cfg.lambda_prox * np.clip(TB, 0, np.inf)
+        )
+        denom_b = 1.0 + self.cfg.k_prox * np.exp(
+            -self.cfg.lambda_prox * np.clip(TA, 0, np.inf)
+        )
         CA, CB = TA / denom_a, TB / denom_b
         labels = np.zeros_like(mask_ds, dtype=np.uint8)
         labels[(CA <= CB) & band] = SOURCE
@@ -254,7 +302,9 @@ class _GeodesicRun:
             labels[z, y, x] = SINK
         return labels
 
-    def _writeback(self, sub_labels_ds: np.ndarray, ds: tuple[int, int, int] | None) -> np.ndarray:
+    def _writeback(
+        self, sub_labels_ds: np.ndarray, ds: tuple[int, int, int] | None
+    ) -> np.ndarray:
         """Upsample sub-labels to crop shape if needed; write into out_zyx; return out_crop view."""
         if ds is not None:
             sub = upsample_labels(sub_labels_ds, ds, self.sv_crop.shape)
@@ -268,9 +318,11 @@ class _GeodesicRun:
 
         out_zyx = np.zeros_like(self.sv_zyx, dtype=np.uint8)
         z0h, y0h, x0h = self.crop_origin
-        out_crop = out_zyx[z0h:z0h + self.sv_crop.shape[0],
-                           y0h:y0h + self.sv_crop.shape[1],
-                           x0h:x0h + self.sv_crop.shape[2]]
+        out_crop = out_zyx[
+            z0h : z0h + self.sv_crop.shape[0],
+            y0h : y0h + self.sv_crop.shape[1],
+            x0h : x0h + self.sv_crop.shape[2],
+        ]
         out_crop[self.sv_crop] = SOURCE
         out_crop[sub == SOURCE] = SOURCE
         out_crop[sub == SINK] = SINK
@@ -282,28 +334,39 @@ class _GeodesicRun:
         prof = self.cfg.profiler
         cfg = self.cfg
         if cfg.enforce_single_cc:
-            with prof.profile("enforce_cc:1st:source"):
-                enforce_single_component(out_crop, SOURCE, self.a_crop, allow_stray=cfg.allow_third_label)
-            with prof.profile("enforce_cc:1st:sink"):
-                enforce_single_component(out_crop, SINK, self.b_crop, allow_stray=cfg.allow_third_label)
+            with prof.profile("enforce_cc:1st"):
+                enforce_single_component(
+                    out_crop, SOURCE, self.a_crop, allow_stray=cfg.allow_third_label
+                )
+                enforce_single_component(
+                    out_crop, SINK, self.b_crop, allow_stray=cfg.allow_third_label
+                )
 
         counts = np.bincount(out_crop.ravel(), minlength=4)
+        self.pre_resolve_counts = (
+            int(counts[SOURCE]),
+            int(counts[SINK]),
+            int(counts[STRAY]),
+        )
         n_stray = int(counts[STRAY])
         moved_src = moved_snk = 0
         if n_stray:
             with prof.profile("resolve_stray"):
                 report = resolve_stray_touching(
                     out_crop,
-                    seeds_source=self.a_crop, seeds_sink=self.b_crop,
+                    seeds_source=self.a_crop,
+                    seeds_sink=self.b_crop,
                     sampling=self.sampling,
                 )
                 moved_src, moved_snk = report.moved_to_source, report.moved_to_sink
 
         if (moved_src or moved_snk) and cfg.enforce_single_cc:
-            with prof.profile("enforce_cc:2nd:source"):
-                enforce_single_component(out_crop, SOURCE, self.a_crop, allow_stray=cfg.allow_third_label)
-            with prof.profile("enforce_cc:2nd:sink"):
-                enforce_single_component(out_crop, SINK, self.b_crop, allow_stray=cfg.allow_third_label)
+            enforce_single_component(
+                out_crop, SOURCE, self.a_crop, allow_stray=cfg.allow_third_label
+            )
+            enforce_single_component(
+                out_crop, SINK, self.b_crop, allow_stray=cfg.allow_third_label
+            )
 
     def _validate(self, out_crop: np.ndarray) -> None:
         for lab in (SOURCE, SINK):
@@ -330,7 +393,11 @@ class _GeodesicRun:
             self.b_snapped = self._snap_team(self.b_full)
 
         # Early-exit: no seeds or no foreground → mark everything SOURCE.
-        if self.a_snapped.size == 0 or self.b_snapped.size == 0 or not np.any(self.sv_zyx):
+        if (
+            self.a_snapped.size == 0
+            or self.b_snapped.size == 0
+            or not np.any(self.sv_zyx)
+        ):
             out = np.zeros_like(self.sv_zyx, dtype=np.uint8)
             out[self.sv_zyx] = SOURCE
             return self._make_result(out, aug_sources, aug_sinks, t0)
@@ -346,21 +413,31 @@ class _GeodesicRun:
 
         with prof.profile("arrival"):
             arrival = compute_TA_TB(
-                cost_ds, sampling_ds, mask_ds, a_sub, b_sub,
-                backend=self.cfg.backend, parallel=self.cfg.parallel,
+                cost_ds,
+                sampling_ds,
+                mask_ds,
+                a_sub,
+                b_sub,
+                backend=self.cfg.backend,
+                parallel=self.cfg.parallel,
             )
         self.stage_elapsed["arrival"] = arrival.elapsed_s
 
-        with prof.profile("label"):
-            sub_labels_ds = self._label_on_grid(arrival, mask_ds, a_sub, b_sub)
+        sub_labels_ds = self._label_on_grid(arrival, mask_ds, a_sub, b_sub)
 
         with prof.profile("writeback"):
             out_crop = self._writeback(sub_labels_ds, ds)
 
         self._enforce_and_resolve(out_crop)
         self._validate(out_crop)
-
-        return self._make_result(self._out_zyx, aug_sources, aug_sinks, t0, arrival_backend=arrival.backend, ds=ds)
+        return self._make_result(
+            self._out_zyx,
+            aug_sources,
+            aug_sinks,
+            t0,
+            arrival_backend=arrival.backend,
+            ds=ds,
+        )
 
     def _make_result(
         self,
@@ -373,22 +450,47 @@ class _GeodesicRun:
         ds: tuple[int, int, int] | None = None,
     ) -> SplitResult:
         labels = from_internal_zyx_volume(out_zyx, self.vol_order)
-        counts = np.bincount(out_zyx.ravel(), minlength=4)
+        if self.sv_crop is not None and self.crop_origin is not None:
+            z0h, y0h, x0h = self.crop_origin
+            zh, yh, xh = self.sv_crop.shape
+            crop = out_zyx[z0h : z0h + zh, y0h : y0h + yh, x0h : x0h + xh]
+        else:
+            crop = out_zyx
+        counts = np.zeros(4, dtype=np.int64)
+        for k in (SOURCE, SINK, STRAY):
+            counts[k] = int((crop == k).sum())
+        pre = getattr(self, "pre_resolve_counts", None)
         diagnostics = {
-            "label_counts": {int(SOURCE): int(counts[SOURCE]),
-                             int(SINK): int(counts[SINK]),
-                             int(STRAY): int(counts[STRAY])},
+            "label_counts": {
+                int(SOURCE): int(counts[SOURCE]),
+                int(SINK): int(counts[SINK]),
+                int(STRAY): int(counts[STRAY]),
+            },
+            "pre_resolve_label_counts": (
+                {int(SOURCE): pre[0], int(SINK): pre[1], int(STRAY): pre[2]}
+                if pre is not None
+                else None
+            ),
             "full_shape_zyx": tuple(int(s) for s in self.sv_zyx.shape),
-            "fg_bbox_shape_zyx": tuple(int(s) for s in (self.sv_crop.shape if self.sv_crop is not None else (0, 0, 0))),
+            "fg_bbox_shape_zyx": tuple(
+                int(s)
+                for s in (self.sv_crop.shape if self.sv_crop is not None else (0, 0, 0))
+            ),
             "downsample_zyx": tuple(int(s) for s in ds) if ds else None,
             "backend": arrival_backend,
             "total_elapsed_s": perf_counter() - t0,
             "stage_elapsed_s": dict(self.stage_elapsed),
         }
-        snapped_src = (seeds_from_zyx(self.a_snapped, self.seed_order)
-                       if self.a_snapped is not None else np.empty((0, 3), int))
-        snapped_snk = (seeds_from_zyx(self.b_snapped, self.seed_order)
-                       if self.b_snapped is not None else np.empty((0, 3), int))
+        snapped_src = (
+            seeds_from_zyx(self.a_snapped, self.seed_order)
+            if self.a_snapped is not None
+            else np.empty((0, 3), int)
+        )
+        snapped_snk = (
+            seeds_from_zyx(self.b_snapped, self.seed_order)
+            if self.b_snapped is not None
+            else np.empty((0, 3), int)
+        )
         return SplitResult(
             labels=labels,
             side_of_label={SOURCE: SOURCE, SINK: SINK},

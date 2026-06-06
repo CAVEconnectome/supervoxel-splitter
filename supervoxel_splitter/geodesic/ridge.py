@@ -85,7 +85,9 @@ def _path_mask(cost: np.ndarray, sampling, start, end) -> np.ndarray | None:
     return m
 
 
-def _cost_from_edt(roi: np.ndarray, sampling, ridge_power: float, eps: float = 1e-6) -> np.ndarray:
+def _cost_from_edt(
+    roi: np.ndarray, sampling, ridge_power: float, eps: float = 1e-6
+) -> np.ndarray:
     """`1 / (eps + normalized_edt ** ridge_power)` inside the ROI mask; big outside."""
     dist = compute_edt(roi, sampling)
     dn = dist / dist.max() if dist.max() > 0 else dist
@@ -137,8 +139,14 @@ class RidgeConnectPrep:
         seed_order: str = "xyz",
     ) -> tuple[np.ndarray, np.ndarray, bool, bool]:
         run = _RidgeRun(
-            self, mask, sources, sinks,
-            voxel_size=voxel_size, vol_order=vol_order, vox_order=vox_order, seed_order=seed_order,
+            self,
+            mask,
+            sources,
+            sinks,
+            voxel_size=voxel_size,
+            vol_order=vol_order,
+            vox_order=vox_order,
+            seed_order=seed_order,
         )
         return run.execute()
 
@@ -189,13 +197,19 @@ class _RidgeRun:
 
     def _build_roi(self, all_pts_zyx: np.ndarray) -> None:
         """Crop a padded bbox around `all_pts_zyx` and pre-downsample it."""
-        z0, y0, x0, z1, y1, x1 = _bbox_pad_zyx(all_pts_zyx, self.sv_zyx.shape, self.cfg.roi_pad_zyx)
+        z0, y0, x0, z1, y1, x1 = _bbox_pad_zyx(
+            all_pts_zyx, self.sv_zyx.shape, self.cfg.roi_pad_zyx
+        )
         self.roi_origin = (z0, y0, x0)
         self.roi = self.sv_zyx[z0:z1, y0:y1, x0:x1]
         sz, sy, sx = self.cfg.downsample
-        self.roi_ds = self.roi[::sz, ::sy, ::sx] if (sz, sy, sx) != (1, 1, 1) else self.roi
+        self.roi_ds = (
+            self.roi[::sz, ::sy, ::sx] if (sz, sy, sx) != (1, 1, 1) else self.roi
+        )
         self.sampling_ds = (
-            self.sampling[0] * sz, self.sampling[1] * sy, self.sampling[2] * sx,
+            self.sampling[0] * sz,
+            self.sampling[1] * sy,
+            self.sampling[2] * sx,
         )
 
     def _to_ds_grid(self, pts_zyx: np.ndarray) -> np.ndarray:
@@ -210,7 +224,11 @@ class _RidgeRun:
                 ds[:, [2, 1, 0]],
                 mask=self.roi_ds,
                 mask_order="zyx",
-                voxel_size=(self.sampling_ds[2], self.sampling_ds[1], self.sampling_ds[0]),
+                voxel_size=(
+                    self.sampling_ds[2],
+                    self.sampling_ds[1],
+                    self.sampling_ds[0],
+                ),
                 use_boundary=False,
                 downsample=False,
             )
@@ -254,7 +272,9 @@ class _RidgeRun:
                 pmask |= m
         return pmask, ok
 
-    def _assemble_team(self, pts_zyx: np.ndarray, path_ds_mask: np.ndarray) -> np.ndarray:
+    def _assemble_team(
+        self, pts_zyx: np.ndarray, path_ds_mask: np.ndarray
+    ) -> np.ndarray:
         """Original seeds + upsampled/dilated path voxels, in seed_order."""
         sz, sy, sx = self.cfg.downsample
         path = upsample_bool(path_ds_mask, (sz, sy, sx), self.roi.shape) & self.roi
@@ -297,7 +317,8 @@ class _RidgeRun:
             return (
                 seeds_from_zyx(a_zyx, self.seed_order),
                 seeds_from_zyx(b_zyx, self.seed_order),
-                False, False,
+                False,
+                False,
             )
 
         # Full-res fallback cost is built only if needed.
@@ -305,22 +326,29 @@ class _RidgeRun:
 
         def _cost_fr():
             if "v" not in _cache:
-                _cache["v"] = _cost_from_edt(self.roi, self.sampling, self.cfg.ridge_power)
+                _cache["v"] = _cost_from_edt(
+                    self.roi, self.sampling, self.cfg.ridge_power
+                )
             return _cache["v"]
 
-        pA, okA = self._augment_team(a_ds, cost_ds, _cost_fr)
-        pB, okB = self._augment_team(b_ds, cost_ds, _cost_fr)
+        with prof.profile("ridge:augment:source"):
+            pA, okA = self._augment_team(a_ds, cost_ds, _cost_fr)
+        with prof.profile("ridge:augment:sink"):
+            pB, okB = self._augment_team(b_ds, cost_ds, _cost_fr)
         if not (okA and okB):
             return (
                 seeds_from_zyx(a_zyx, self.seed_order),
                 seeds_from_zyx(b_zyx, self.seed_order),
-                okA, okB,
+                okA,
+                okB,
             )
 
         a_aug = self._assemble_team(a_zyx, pA)
         b_aug = self._assemble_team(b_zyx, pB)
         logger.debug(
             "ridge: +%d voxels for A, +%d for B, %.3fs",
-            len(a_aug) - len(self.a_in_zyx), len(b_aug) - len(self.b_in_zyx), perf_counter() - t0,
+            len(a_aug) - len(self.a_in_zyx),
+            len(b_aug) - len(self.b_in_zyx),
+            perf_counter() - t0,
         )
         return a_aug, b_aug, True, True
