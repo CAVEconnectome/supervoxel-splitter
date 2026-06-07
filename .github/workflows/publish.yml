@@ -15,7 +15,20 @@ on:
           - pypi
 
 jobs:
+  validate-tag:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject non-SemVer tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          [[ "$TAG" =~ $re ]] || { echo "Tag '$TAG' is not SemVer (vMAJOR.MINOR.PATCH[-pre][+build])"; exit 1; }
+
   publish:
+    needs: [validate-tag]
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.validate-tag.result == 'success') }}
     runs-on: ubuntu-latest
     environment: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'pypi' }}
     permissions:
