@@ -78,6 +78,17 @@ v0.1.0 covers `GeodesicSplitter`. `WatershedSplitter` and `NoopSplitter` ship
 as small reference impls demonstrating the protocol; production-quality
 parity with geodesic is out of scope for v0.1.0.
 
+## Release
+
+Published to PyPI by a one-click workflow — no manual tag or version edit.
+
+- **Release:** Actions → **CI** → **Run workflow** → choose `part` (`major`/`minor`/`patch`), or
+  `gh workflow run test.yml -f part=patch`. It computes the next version from the latest `vX.Y.Z`
+  tag, tags it, builds, and publishes to PyPI (OIDC trusted publishing).
+- **Preview:** `dry-run=true` prints the next version without tagging or publishing.
+
+The version is derived from the git tag by `setuptools_scm`; there is no version literal to bump.
+
 ## License
 
 MIT.
